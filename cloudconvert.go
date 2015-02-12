@@ -90,7 +90,7 @@ type ConversionType struct {
 //
 // Either input params can be zero value ("") for no filtering.
 func ConversionTypes(inputFormat, outputFormat string) ([]ConversionType, error) {
-	var v url.Values
+	v := make(url.Values)
 	if inputFormat != "" {
 		v.Set("inputformat", inputFormat)
 	}
