@@ -19,6 +19,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -157,64 +158,185 @@ func (p Process) ID() string {
 // UploadFile uploads a file, requesting the output format.
 type Options struct {
 	Email          bool
-	Output         string
+	Wait           bool
+	Input          interface{}
+	Output         interface{}
 	Callback       string
 	ConversionOpts map[string]string
 }
 
-// UploadFile uploads the file with outFormat, and opts options are optional.
-func (p Process) UploadFile(file, outFormat string, opts *Options) (StatusResponse, error) {
+const (
+	UploadOption   = "upload"
+	DownloadOption = "download"
+)
+
+type S3Option map[string]string
+
+type FtpOption map[string]string
+
+func mapInput(m map[string]string, mw *multipart.Writer, input interface{}) error {
+
+	switch input.(type) {
+	case S3Option:
+		for k, v := range input.(S3Option) {
+			m[fmt.Sprintf("output[s3][%s]", k)] = v
+		}
+	case FtpOption:
+		for k, v := range input.(FtpOption) {
+			m[fmt.Sprintf("output[ftp][%s]", k)] = v
+		}
+	case string:
+		switch input {
+		case DownloadOption:
+			m["input"] = DownloadOption
+
+		case UploadOption:
+			m["input"] = UploadOption
+
+			file := m["file"]
+			delete(m, "file")
+
+			pw, err := mw.CreateFormFile("file", filepath.Base(file))
+			if err != nil {
+				return err
+			}
+			f, err := os.Open(file)
+			if err != nil {
+				return err
+			}
+			defer f.Close()
+
+			Log.Debug("Uploading", "file", f.Name())
+			n, err := io.Copy(pw, f)
+			if err == nil {
+				Log.Debug("Uploaded", "bytes", n)
+			} else {
+				Log.Error("Uploaded", "bytes", n, "error", err)
+			}
+
+		default:
+			return errors.New("Unknown input type")
+		}
+	default:
+		return errors.New("Unknown input type")
+	}
+
+	return nil
+}
+
+func mapOutput(m map[string]string, output interface{}) error {
+	switch output.(type) {
+	case S3Option:
+		for k, v := range output.(S3Option) {
+			m[fmt.Sprintf("output[s3][%s]", k)] = v
+		}
+	case FtpOption:
+		for k, v := range output.(FtpOption) {
+			m[fmt.Sprintf("output[ftp][%s]", k)] = v
+		}
+	}
+
+	return nil
+}
+
+type result struct {
+	StatusResponse StatusResponse
+	Error          error
+}
+
+type Defer chan result
+
+func (d Defer) Error(err error) { d <- result{Error: err} }
+
+func (d Defer) Done(sr StatusResponse) { d <- result{StatusResponse: sr} }
+
+func (d Defer) Wait() (StatusResponse, error) {
+	result := <-d
+	return result.StatusResponse, result.Error
+}
+
+func (p *Process) Convert(file, outFormat string, opts *Options) (StatusResponse, error) {
+
+	d := make(Defer)
+
 	r, w := io.Pipe()
 	bw := bufio.NewWriter(w)
 	mw := multipart.NewWriter(bw)
-	var sr StatusResponse
-	var o Options
-	if opts != nil {
-		o = *opts
-	}
-	omap := make(map[string]string, 5+len(opts.ConversionOpts))
-	omap["input"] = "upload"
-	omap["outputformat"] = outFormat
-	omap["output"] = o.Output
-	omap["callback"] = o.Callback
-	if o.Email {
-		omap["email"] = "1"
-	}
-	for k, v := range o.ConversionOpts {
-		omap["options["+k+"]"] = v
-	}
-	if err := mwSetMap(mw, omap); err != nil {
-		return sr, err
-	}
-	pw, err := mw.CreateFormFile("file", filepath.Base(file))
-	if err != nil {
-		return sr, err
-	}
-	f, err := os.Open(file)
-	if err != nil {
-		return sr, err
-	}
-	defer f.Close()
+
 	go func() {
 		defer w.Close()
 		defer bw.Flush()
 		defer mw.Close()
-		Log.Debug("Uploading", "file", f.Name())
-		n, e := io.Copy(pw, f)
-		if e == nil {
-			Log.Debug("Uploaded", "bytes", n)
-		} else {
-			Log.Error("Uploaded", "bytes", n, "error", e)
+
+		var o Options
+		if opts != nil {
+			o = *opts
+		}
+
+		if o.Input == nil {
+			o.Input = "upload"
+		}
+
+		omap := make(map[string]string, 10+len(opts.ConversionOpts))
+		omap["file"] = file
+
+		if err := mapInput(omap, mw, o.Input); err != nil {
+			d.Error(err)
+			return
+		}
+
+		if err := mapOutput(omap, o.Input); err != nil {
+			d.Error(err)
+			return
+		}
+
+		omap["outputformat"] = outFormat
+		if o.Callback != "" {
+			omap["callback"] = o.Callback
+		}
+
+		if o.Email {
+			omap["email"] = "1"
+		}
+		if o.Wait {
+			omap["wait"] = "1"
+		}
+		for k, v := range o.ConversionOpts {
+			omap[fmt.Sprintf("options[%s]", k)] = v
+		}
+
+		if err := mwSetMap(mw, omap); err != nil {
+			d.Error(err)
+			return
 		}
 	}()
-	resp, err := http.Post(p.URL, mw.FormDataContentType(), r)
-	if err == nil && resp.Body != nil {
+
+	go func() {
+		resp, err := http.Post(p.URL, mw.FormDataContentType(), r)
+
+		if err != nil {
+			d.Error(err)
+			return
+		}
+
+		if resp.Body == nil {
+			d.Error(errors.New("Empty response body"))
+			return
+		}
 		defer resp.Body.Close()
+
+		var sr StatusResponse
+
 		if err = json.NewDecoder(resp.Body).Decode(&sr); err != nil {
 			Log.Error("UploadFile", "error", err)
+			d.Error(err)
+			return
 		}
-	}
-	return sr, err
+
+		d.Done(sr)
+	}()
+
+	return d.Wait()
 }
 
 func mwSet(mw *multipart.Writer, key, value string) error {
@@ -272,10 +394,10 @@ type StatusOutput struct {
 }
 
 type StatusConverter struct {
-	Format   string            `json:"format"`
-	Type     string            `json:"type"`
-	Options  map[string]string `json:"options"`
-	Duration float64           `json:"duration"`
+	Format   string                 `json:"format"`
+	Type     string                 `json:"type"`
+	Options  map[string]interface{} `json:"options"`
+	Duration float64                `json:"duration"`
 }
 
 // Status returns the conversion process' status info.
@@ -385,9 +507,8 @@ func NewConversion(apiKey, fromFile, toFile, fromFormat, toFormat string) (Conve
 
 // Start uploads the previously given file, hence starting the conversion process.
 // opts can be nil for default download file.
-func (c Conversion) Start(opts *Options) error {
-	_, err := c.Process.UploadFile(c.fromFile, c.toFormat, opts)
-	return err
+func (c Conversion) Start(opts *Options) (StatusResponse, error) {
+	return c.Process.Convert(c.fromFile, c.toFormat, opts)
 }
 
 // Wait blocks until the process' status (step) changes to "finished";
