@@ -162,6 +162,7 @@ type Options struct {
 	Input          interface{}
 	Output         interface{}
 	Callback       string
+	Filename       string
 	ConversionOpts map[string]string
 }
 
@@ -285,7 +286,7 @@ func (p *Process) Convert(file, outFormat string, opts *Options) (StatusResponse
 			return
 		}
 
-		if err := mapOutput(omap, o.Input); err != nil {
+		if err := mapOutput(omap, o.Output); err != nil {
 			d.Error(err)
 			return
 		}
@@ -293,6 +294,10 @@ func (p *Process) Convert(file, outFormat string, opts *Options) (StatusResponse
 		omap["outputformat"] = outFormat
 		if o.Callback != "" {
 			omap["callback"] = o.Callback
+		}
+
+		if o.Filename != "" {
+			omap["filename"] = o.Filename
 		}
 
 		if o.Email {
